@@ -1,0 +1,1655 @@
+#!/usr/bin/env python3
+# coding: utf-8
+
+"""Self contained script to implement a shell to talk to a Sieve sever."""
+
+# I'm not proud of this butchery, but I wanted a self-contained managesieve
+# client.  I took sievelib's managesieve.py, pulled in the bits and pieces
+# it imported from non-standard modules, made it pure Python 3 and then just
+# continued to hack on it including making pylint happy.  Sorry.
+
+# Self-contained != modular.  Apologize to pylint as well:
+# pylint: disable=C0302
+
+# Sievelib's license follows:
+#
+# Copyright (c) 2011-2015 Antoine Nguyen <tonio@ngyn.org>
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+# THE SOFTWARE.
+#
+# My modifications are covered by the same license.
+
+# Possible enhancements:
+# Completions (complete_*) for the do_* commands.
+# Print out warnings from a putscript that returns OK and in general,
+#  revisit the handling of server responses because RFC 5804 says that
+#  "implementations MUST NOT attempt to parse the message for meaning."
+# Command to allow debug to be turned on, off and perhaps responses only.
+# Command or option to write a skeleton ~/.sieveshrc file.
+
+import argparse
+import base64
+import binascii
+import cmd
+import configparser
+import errno
+import fnmatch
+import getpass
+import hashlib
+import os
+import random
+import re
+import readline
+import shlex
+import shutil
+import socket
+import ssl
+import sys
+from dataclasses import dataclass
+
+# A MANAGESIEVE client.
+#
+# A protocol for securely managing Sieve scripts on a remote server.
+# This protocol allows a user to have multiple scripts, and also alerts
+# a user to syntactically flawed scripts.
+#
+# Implementation based on RFC 5804.
+
+# from .digest_md5 import DigestMD5
+class DigestMD5:
+    """Class to implement the DIGEST-MD5 interaction with a Sieve server."""
+    def __init__(self, challenge, digesturi):
+        self.__digesturi = digesturi
+        self.__challenge = challenge
+        self.cnonce = None
+        self.realm = None
+
+        self.__params = {}
+        pexpr = re.compile(r'(\w+)="(.+)"')
+        for elt in base64.b64decode(challenge).split(","):
+            match = pexpr.match(elt)
+            if match is None:
+                continue
+            self.__params[match.group(1)] = match.group(2)
+
+    @staticmethod
+    def __make_cnonce():
+        ret = ""
+        for _i in range(12):
+            ret += chr(random.randint(0, 0xff))
+        return base64.b64encode(ret)
+
+    @staticmethod
+    def __digest(value):
+        return hashlib.md5(value).digest()
+
+    @staticmethod
+    def __hexdigest(value):
+        return binascii.hexlify(hashlib.md5(value).digest())
+
+    def __make_response(self, username, password, check=False):
+        auth1 = "%s:%s:%s" % (
+            self.__digest("%s:%s:%s" % (username, self.realm, password)),
+            self.__params["nonce"], self.cnonce
+        )
+        if check:
+            auth2 = ":%s" % self.__digesturi
+        else:
+            auth2 = "AUTHENTICATE:%s" % self.__digesturi
+        resp = "%s:%s:00000001:%s:auth:%s" \
+               % (self.__hexdigest(auth1), self.__params["nonce"],
+                  self.cnonce, self.__hexdigest(auth2))
+
+        return self.__hexdigest(resp)
+
+    def response(self, username, password, authz_id=''):
+        """Construct the response to a Sieve server DIGEST-MD5 challenge.
+
+        :param username: The username to use in constructing the response.
+        :param password: The password to use in constructing the response.
+        :param authz_id: The authorization identity to send to the server.
+        :rtype: bytes
+        :return: b64encoded response to send to server.
+        """
+        self.realm = self.__params["realm"] if "realm" in self.__params else ""
+        self.cnonce = self.__make_cnonce()
+        respvalue = self.__make_response(username, password)
+
+        dgres = 'username="%s",%snonce="%s",cnonce="%s",nc=00000001,qop=auth,' \
+                'digest-uri="%s",response=%s' \
+            % (username,
+               ('realm="%s",' % self.realm) if self.realm else "",
+               self.__params["nonce"], self.cnonce, self.__digesturi, respvalue)
+        if authz_id:
+            if isinstance(authz_id, str):
+                authz_id = authz_id.encode("utf-8")
+            dgres += ',authzid="%s"' % authz_id
+
+        return base64.b64encode(dgres)
+
+    def check_last_challenge(self, username, password, value):
+        """Verify the server's response auth.
+
+        :param username: The username to use in constructing the response.
+        :param password: The password to use in constructing the response.
+        :param value: The server's response auth.
+        :rtype: boolean
+        :return: True if the response auth matched expectations.
+        """
+        challenge = base64.b64decode(value.strip('"'))
+        return challenge == \
+               ("rspauth=%s" % self.__make_response(username, password, True))
+
+# from . import tools
+def to_bytes(in_str, encoding="utf-8"):
+    """Convert a string to bytes."""
+    if isinstance(in_str, bytes):
+        return in_str
+    return bytes(in_str, encoding)
+
+
+CRLF = b"\r\n"
+
+KNOWN_CAPABILITIES = [u"IMPLEMENTATION", u"SASL", u"SIEVE",
+                      u"STARTTLS", u"NOTIFY", u"LANGUAGE",
+                      u"VERSION"]
+
+SUPPORTED_AUTH_MECHS = [u"DIGEST-MD5", u"PLAIN", u"LOGIN"]
+
+
+class Error(Exception):
+    """Exception raised by the Client class on an error."""
+
+
+class _Response(Exception):
+    def __init__(self, code, data):
+        super(_Response, self).__init__("%s %s" % (code, data))
+        self.code = code
+        self.data = data
+
+
+class _Literal(Exception):
+    def __init__(self, value):
+        super(_Literal, self).__init__("{%d}" % value)
+        self.value = value
+
+
+def reconnect_if_needed(meth):
+    """Simple class method decorator.
+
+    If a socket exception occurs when calling meth, reconnect & retry meth.
+
+    :param meth: the original called method
+    """
+
+    def retrier(cls, *args, **kwargs):
+
+        try:
+            return meth(cls, *args, **kwargs)
+        except OSError as error:
+            if error.errno in {errno.EPIPE, errno.ECONNRESET}:
+                cls.connect()
+                return meth(cls, *args, **kwargs)
+            raise
+
+    return retrier
+
+
+@dataclass
+class ConnectInfo:
+    """Data class to consolidate the Sieve server connection information."""
+    host: str = None
+    port: int = 0
+    user: str = None
+    password: str = None
+    authz_id: bytes = b''
+
+
+class Client:
+    """Class to implement communication with a Sieve server."""
+    _read_size = 4096
+    _read_timeout = 5
+    __respcode_expr = re.compile(br"(OK|NO|BYE)\s*(.+)?")
+    __error_expr = re.compile(br'(\([\w/-]+\))?\s*(".+")')
+    __size_expr = re.compile(br"\{(\d+)\+?\}")
+    __active_expr = re.compile(br"ACTIVE", re.IGNORECASE)
+
+    def __init__(self, conn_info, authmech=None, debug=False):
+        self.conn_info = conn_info
+        if authmech is None or authmech not in SUPPORTED_AUTH_MECHS:
+            self.mech_list = SUPPORTED_AUTH_MECHS
+        else:
+            self.mech_list = [authmech]
+        self.error = (None, None)
+        self.__debug = debug
+        self.sock = None
+        self.__read_buffer = b""
+
+        self.__capabilities = {}
+
+        self.connect()
+
+    def __del__(self):
+        if self.sock is not None:
+            try:
+                self.sock.shutdown(socket.SHUT_WR)
+            except OSError as error:
+                if error.errno == errno.ENOTCONN:
+                    pass
+            self.sock.close()
+            self.sock = None
+
+    def __dprint(self, message):
+        if not self.__debug:
+            return
+        print("DEBUG: %s" % message)
+
+    def __read_block(self, size):
+        """Read a block of 'size' bytes from the server.
+
+        An internal buffer is used to read data from the server. If
+        enough data is available from it, we return that data.
+
+        Eventually, we try to grab the missing part from the server
+        for Client._read_timeout seconds. If no data can be
+        retrieved, it is considered as a fatal error and an 'Error'
+        exception is raised.
+
+        :param size: number of bytes to read
+        :rtype: string
+        :returns: the read block (can be empty)
+        """
+        buf = b""
+        if self.__read_buffer:
+            buflen = len(self.__read_buffer)
+            limit = (
+                size if size <= buflen else buflen
+            )
+            buf = self.__read_buffer[:limit]
+            self.__read_buffer = self.__read_buffer[limit:]
+            size -= limit
+        if not size:
+            return buf
+        try:
+            buf += self.sock.recv(size)
+        except (socket.timeout, ssl.SSLError):
+            raise Error("Failed to read %d bytes from the server" % size)
+        self.__dprint(buf)
+        return buf
+
+    def __read_line(self):
+        """Read one line from the server.
+
+        An internal buffer is used to read data from the server
+        (blocks of Client._read_size bytes). If the buffer
+        is not empty, we try to find an entire line to return.
+
+        If we failed, we try to read new content from the server for
+        Client._read_timeout seconds. If no data can be
+        retrieved, it is considered as a fatal error and an 'Error'
+        exception is raised.
+
+        :rtype: string
+        :return: the read line
+        """
+        ret = b""
+        while True:
+            try:
+                pos = self.__read_buffer.index(CRLF)
+                ret = self.__read_buffer[:pos]
+                self.__read_buffer = self.__read_buffer[pos + len(CRLF):]
+                break
+            except ValueError:
+                pass
+            try:
+                nval = self.sock.recv(Client._read_size)
+                self.__dprint(nval)
+                if not nval:
+                    break
+                self.__read_buffer += nval
+            except (socket.timeout, ssl.SSLError):
+                raise Error("Failed to read data from the server")
+
+        if ret:
+            match = Client.__size_expr.match(ret)
+            if match:
+                raise _Literal(int(match.group(1)))
+
+            match = Client.__respcode_expr.match(ret)
+            if match:
+                if match.group(1) == b"BYE":
+                    raise Error("Connection closed by server")
+                if match.group(1) == b"NO":
+                    self.__parse_error(match.group(2))
+                raise _Response(match.group(1), match.group(2))
+        return ret
+
+    def __read_response(self, nblines=-1):
+        r"""Read a response from the server.
+
+        In the usual case, we read lines until we find one that looks
+        like a response (OK|NO|BYE\s*(.+)?).
+
+        If *nblines* > 0, we read excactly nblines before returning.
+
+        :param nblines: number of lines to read (default : -1)
+        :rtype: tuple
+        :return: a tuple of the form (code, data, response). If
+        nblines is provided, code and data can be equal to None.
+        """
+        resp, code, data = (b"", None, None)
+        cpt = 0
+        while True:
+            try:
+                line = self.__read_line()
+            except _Response as inst:
+                code = inst.code
+                data = inst.data
+                break
+            except _Literal as inst:
+                resp += self.__read_block(inst.value)
+                if not resp.endswith(CRLF):
+                    resp += self.__read_line() + CRLF
+                continue
+            if not line:
+                continue
+            resp += line + CRLF
+            cpt += 1
+            if nblines != -1 and cpt == nblines:
+                break
+
+        return (code, data, resp)
+
+    @staticmethod
+    def __prepare_args(args):
+        r"""Format command arguments before sending them.
+
+        Command arguments of type string must be quoted, the only
+        exception concerns size indication (of the form {\d\+?}).
+
+        :param args: list of arguments
+        :return: a list for transformed arguments
+        """
+        ret = []
+        for arg in args:
+            if isinstance(arg, bytes):
+                if Client.__size_expr.match(arg):
+                    ret += [arg]
+                else:
+                    ret += [b'"' + arg + b'"']
+                continue
+            ret += [bytes(str(arg).encode("utf-8"))]
+        return ret
+
+    def __send_command(
+            self, name, args=None, extralines=None, nblines=-1):
+        """Send a command to the server.
+
+        If args is not empty, we concatenate the given command with
+        the content of this list. If extralines is not empty, they are
+        sent one by one to the server. (CLRF are automatically
+        appended to them)
+
+        We wait for a response just after the command has been sent.
+
+        :param name: the command to sent
+        :param args: a list of arguments for this command
+        :param extralines: a list of extra lines to sent after the command
+        :param nblines: the number of response lines to read (all by default)
+
+        :returns: a tuple of the form (code, data, response)
+        """
+        tosend = name.encode("utf-8")
+        if args:
+            tosend += b" " + b" ".join(self.__prepare_args(args))
+        self.__dprint(b"Command: " + tosend)
+        self.sock.sendall(tosend + CRLF)
+        if extralines:
+            for line in extralines:
+                self.sock.sendall(line + CRLF)
+        code, data, content = self.__read_response(nblines)
+
+        if isinstance(code, bytes):
+            code = code.decode("utf-8")
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+
+        return (code, data, content)
+
+    def __get_capabilities(self):
+        code, _data, capabilities = self.__read_response()
+        if code == "NO":
+            return False
+
+        for line in capabilities.splitlines():
+            parts = line.split(None, 1)
+            cname = parts[0].strip(b'"').decode("utf-8")
+            if cname not in KNOWN_CAPABILITIES:
+                continue
+            self.__capabilities[cname] = (
+                parts[1].strip(b'"').decode("utf-8")
+                if len(parts) > 1 else None
+            )
+        return True
+
+    def __parse_error(self, text):
+        r"""Parse an error received from the server.
+
+        if text corresponds to a size indication, we grab the
+        remaining content from the server.
+
+        Otherwise, we try to match an error of the form \(\w+\)?\s*".+"
+
+        On success, the public member error is
+        filled with the parsing results.
+
+        :param text: the response to parse
+        """
+        match = Client.__size_expr.match(text)
+        if match is not None:
+            self.error = (b"", self.__read_block(int(match.group(1)) + 2))
+            return
+
+        match = Client.__error_expr.match(text)
+        if match is None:
+            raise Error("Bad error message")
+        if match.group(1) is not None:
+            errcode = match.group(1).strip(b"()")
+        else:
+            errcode = b""
+        self.error = (errcode, match.group(2).strip(b'"'))
+
+    def _plain_authentication(self):
+        """SASL PLAIN authentication
+
+        :return: True on success, False otherwise.
+        """
+        paraml = [self.conn_info.authz_id,
+                  self.conn_info.user.encode("utf-8"),
+                  self.conn_info.password.encode("utf-8")]
+        params = base64.b64encode(b'\0'.join(paraml))
+        code, _data, _content = self.__send_command("AUTHENTICATE",
+                                                    [b"PLAIN", params])
+        if code == "OK":
+            return True
+        return False
+
+    def _login_authentication(self):
+        """SASL LOGIN authentication
+
+        :return: True on success, False otherwise.
+        """
+        login_u = self.conn_info.user.encode("utf-8")
+        password_u = self.conn_info.password.encode("utf-8")
+        extralines = [b'"%s"' % base64.b64encode(login_u),
+                      b'"%s"' % base64.b64encode(password_u)]
+        code, _data, _content = self.__send_command("AUTHENTICATE", [b"LOGIN"],
+                                                    extralines=extralines)
+        if code == "OK":
+            return True
+        return False
+
+    def _digest_md5_authentication(self):
+        """SASL DIGEST-MD5 authentication
+
+        :return: True on success, False otherwise.
+        """
+        code, _data, challenge = \
+            self.__send_command("AUTHENTICATE", [b"DIGEST-MD5"], nblines=1)
+        dmd5 = DigestMD5(challenge, "sieve/%s" % self.conn_info.host)
+
+        code, _data, challenge = self.__send_command(
+            '"%s"' % dmd5.response(self.conn_info.user,
+                                   self.conn_info.password,
+                                   self.conn_info.authz_id),
+            nblines=1
+        )
+        if not challenge:
+            return False
+        if not dmd5.check_last_challenge(self.conn_info.user,
+                                         self.conn_info.password,
+                                         challenge):
+            self.error = (b'', "Bad challenge received from server")
+            return False
+        code, _data, _content = self.__send_command('""')
+        if code == "OK":
+            return True
+        return False
+
+    def __authenticate(self):
+        """AUTHENTICATE command
+
+        Actually, it is just a wrapper to the real commands (one by
+        mechanism). We try all supported mechanisms (from the
+        strongest to the weakest) until we find one supported by the
+        server.
+
+        Then we try to authenticate (only once).
+
+        :return: True on success, False otherwise
+        """
+        if "SASL" not in self.__capabilities:
+            raise Error("SASL not supported by the server")
+        srv_mechanisms = self.get_sasl_mechanisms()
+
+        for mech in self.mech_list:
+            if mech not in srv_mechanisms:
+                continue
+            mech = mech.lower().replace("-", "_")
+            auth_method = getattr(self, "_%s_authentication" % mech)
+            return auth_method()
+
+        self.error = (b'', b"No suitable mechanism found")
+        return False
+
+    def __starttls(self):
+        """STARTTLS command
+
+        See MANAGESIEVE specifications, section 2.2.
+
+        :rtype: boolean
+        """
+        if not self.has_tls_support():
+            raise Error("STARTTLS not supported by the server")
+        code, _data, _content = self.__send_command("STARTTLS")
+        if code != "OK":
+            return False
+        try:
+            nsock = ssl.wrap_socket(self.sock, None, None)
+        except ssl.SSLError as error:
+            raise Error("SSL error: %s" % str(error))
+        self.sock = nsock
+        self.__capabilities = {}
+        self.__get_capabilities()
+        return True
+
+    def get_implementation(self):
+        """Returns the IMPLEMENTATION value.
+
+        It is read from server capabilities. (see the CAPABILITY
+        command)
+
+        :rtype: string
+        """
+        return self.__capabilities["IMPLEMENTATION"]
+
+    def get_sasl_mechanisms(self):
+        """Returns the supported authentication mechanisms.
+
+        They're read from server capabilities. (see the CAPABILITY
+        command)
+
+        :rtype: list of string
+        """
+        return self.__capabilities["SASL"].split()
+
+    def has_tls_support(self):
+        """Tells if the server has STARTTLS support or not.
+
+        It is read from server capabilities. (see the CAPABILITY
+        command)
+
+        :rtype: boolean
+        """
+        return "STARTTLS" in self.__capabilities
+
+    def get_sieve_capabilities(self):
+        """Returns the SIEVE extensions supported by the server.
+
+        They're read from server capabilities. (see the CAPABILITY
+        command)
+
+        :rtype: string
+        """
+        if isinstance(self.__capabilities["SIEVE"], str):
+            self.__capabilities["SIEVE"] = self.__capabilities["SIEVE"].split()
+        return self.__capabilities["SIEVE"]
+
+    def connect(self):
+        """Establish a connection with the server.
+
+        This function must be used. It read the server capabilities
+        and wraps calls to STARTTLS and AUTHENTICATE commands.
+
+        :rtype: boolean
+        """
+        try:
+            self.sock = socket.create_connection((self.conn_info.host,
+                                                  self.conn_info.port))
+            self.sock.settimeout(Client._read_timeout)
+        except OSError as msg:
+            raise Error("Connection to server failed: %s" % str(msg))
+
+        if not self.__get_capabilities():
+            raise Error("Failed to read capabilities from server")
+        if self.has_tls_support() and not self.__starttls():
+            raise Error("TLS negotiation failed")
+        if not self.__authenticate():
+            raise Error("Authentication failed")
+
+    def logout(self):
+        """Disconnect from the server
+
+        See MANAGESIEVE specifications, section 2.3
+        """
+        try:
+            self.__send_command("LOGOUT")
+        except OSError as error:
+            if error.errno == errno.ENOTCONN:
+                pass
+
+    @reconnect_if_needed
+    def capability(self):
+        """Ask server capabilities.
+
+        See MANAGESIEVE specifications, section 2.4 This command does
+        not affect capabilities recorded by this client.
+
+        :rtype: string
+        """
+        code, _data, capabilities = (
+            self.__send_command("CAPABILITY"))
+        if code == "OK":
+            return capabilities
+        return None
+
+    @reconnect_if_needed
+    def havespace(self, scriptname, scriptsize):
+        """Ask for available space.
+
+        See MANAGESIEVE specifications, section 2.5
+
+        :param scriptname: script's name
+        :param scriptsize: script's size
+        :rtype: boolean
+        """
+        code, _data, _content = self.__send_command(
+            "HAVESPACE", [scriptname.encode("utf-8"), scriptsize])
+        if code == "OK":
+            return True
+        return False
+
+    @reconnect_if_needed
+    def listscripts(self):
+        """List available scripts.
+
+        See MANAGESIEVE specifications, section 2.7
+
+        :returns: a 2-uple (active script, [script1, ...])
+        """
+        code, _data, listing = self.__send_command("LISTSCRIPTS")
+        if code == "NO":
+            return None
+        ret = []
+        active_script = None
+        for line in listing.splitlines():
+            if Client.__size_expr.match(line):
+                continue
+            match = re.match(br'"([^"]+)"\s*(.+)', line)
+            if match is None:
+                ret += [line.strip(b'"').decode("utf-8")]
+                continue
+            script = match.group(1).decode("utf-8")
+            if Client.__active_expr.match(match.group(2)):
+                active_script = script
+                continue
+            ret += [script]
+        self.__dprint(ret)
+        return (active_script, ret)
+
+    @reconnect_if_needed
+    def getscript(self, name):
+        """Download a script from the server
+
+        See MANAGESIEVE specifications, section 2.9
+
+        :param name: script's name
+        :rtype: string
+        :returns: the script's content on succes, None otherwise
+        """
+        code, _data, content = self.__send_command("GETSCRIPT",
+                                                   [name.encode("utf-8")])
+        if code == "OK":
+            lines = content.splitlines()
+            if Client.__size_expr.match(lines[0]) is not None:
+                lines = lines[1:]
+            return u"\n".join([line.decode("utf-8") for line in lines])
+        return None
+
+    @reconnect_if_needed
+    def putscript(self, name, content):
+        """Upload a script to the server
+
+        See MANAGESIEVE specifications, section 2.6
+
+        :param name: script's name
+        :param content: script's content
+        :rtype: boolean
+        """
+        content = to_bytes(content)
+        content = to_bytes("{%d+}" % len(content)) + CRLF + content
+        code, _data, _content = (
+            self.__send_command("PUTSCRIPT", [name.encode("utf-8"), content]))
+        if code == "OK":
+            return True
+        return False
+
+    @reconnect_if_needed
+    def deletescript(self, name):
+        """Delete a script from the server
+
+        See MANAGESIEVE specifications, section 2.10
+
+        :param name: script's name
+        :rtype: boolean
+        """
+        code, _data, _content = self.__send_command("DELETESCRIPT",
+                                                    [name.encode("utf-8")])
+        if code == "OK":
+            return True
+        return False
+
+    @reconnect_if_needed
+    def renamescript(self, oldname, newname):
+        """Rename a script on the server
+
+        See MANAGESIEVE specifications, section 2.11.1
+
+        As this command is optional, we emulate it if the server does
+        not support it.
+
+        :param oldname: current script's name
+        :param newname: new script's name
+        :rtype: boolean
+        """
+        if "VERSION" in self.__capabilities:
+            code, _data, _content = self.__send_command(
+                "RENAMESCRIPT",
+                [oldname.encode("utf-8"), newname.encode("utf-8")])
+            return code == "OK"
+
+        (active_script, scripts) = self.listscripts()
+        condition = (
+            oldname != active_script and
+            (scripts is None or oldname not in scripts)
+        )
+        if condition:
+            self.error = (b'', b"Old script does not exist")
+            return False
+        if newname in scripts:
+            self.error = (b'', b"New script already exists")
+            return False
+        oldscript = self.getscript(oldname)
+        if oldscript is None or not self.putscript(newname, oldscript):
+            return False
+        if active_script == oldname:
+            if not self.setactive(newname):
+                return False
+        return self.deletescript(oldname)
+
+    @reconnect_if_needed
+    def setactive(self, scriptname):
+        """Define the active script
+
+        See MANAGESIEVE specifications, section 2.8
+
+        If scriptname is empty, the current active script is disabled,
+        ie. there will be no active script anymore.
+
+        :param scriptname: script's name
+        :rtype: boolean
+        """
+        code, _data, _content = self.__send_command(
+            "SETACTIVE", [scriptname.encode("utf-8")])
+        if code == "OK":
+            return True
+        return False
+
+    @reconnect_if_needed
+    def checkscript(self, content):
+        """Check whether a script is valid
+
+        See MANAGESIEVE specifications, section 2.12
+
+        :param name: script's content
+        :rtype: boolean
+        """
+        if "VERSION" not in self.__capabilities:
+            raise NotImplementedError(
+                "server does not support CHECKSCRIPT command")
+        content = to_bytes(content)
+        content = to_bytes("{%d+}" % len(content)) + CRLF + content
+        code, _data, _content = self.__send_command("CHECKSCRIPT", [content])
+        if code == "OK":
+            return True
+        return False
+
+
+def multicolumn_print(str_list):
+    """Prints out a the strings in strlist à la the ls multicolumn output
+
+    If str_list is None, nothing will be printed.  Otherwise the strings in
+    str_list will be printed to stdout in top to bottom, left to right
+    columns taking the terminal's width into account.
+
+    :param str_list: The list of strings to print.
+    """
+    if not str_list:
+        return
+    term_width, _term_height = shutil.get_terminal_size()
+    max_item_len = max([len(i) for i in str_list])
+    col_len = (int((max_item_len + 1) / 8) + 1) * 8
+    num_cols = int((term_width + 1) / col_len)
+    num_rows = int((len(str_list) + num_cols - 1) / num_cols)
+    for row in range(num_rows):
+        line = ''
+        for col in range(num_cols):
+            list_index = col * num_rows + row
+            if list_index < len(str_list):
+                item = str_list[list_index]
+                line += item
+                if col < num_cols - 1:
+                    tab_len = col_len - (int(len(item) / 8) * 8)
+                    line += (int(tab_len / 8)) * '\t'
+        print(line)
+
+
+def glob_match(sources, globs, source_type='script'):
+    """Returns a list of the sources that match any of the globs
+
+    If globs is None, sources will be returned as is.  Otherwise, a list is
+    returned that contains all sources that match any of the globs.  If a
+    glob doesn't match any patterns, an error telling the user will be
+    printed on stderr.
+
+    :param sources: The list of sources to match against the globs.
+    :param globs: The list of glob patterns to match.
+
+    :returns: a list of the sources that match any of the globs.
+    """
+    if not globs:
+        return sources
+
+    matches = []
+    for glob_str in globs:
+        this_match = [s for s in sources if fnmatch.fnmatch(s, glob_str)]
+        if this_match:
+            matches += sorted(this_match)
+        else:
+            print(f'{glob_str}: No such {source_type}', file=sys.stderr)
+    return matches
+
+
+def process_script_globs(server_scripts, globs, sort=False):
+    """Returns a list of the server_scripts that match any of the globs.
+
+    :param server_scripts: Scripts on server as returned by Client.listscripts()
+    :param globs: A list of the glob patterns to match.
+    :param sort: Iff true, the returned list will be sorted.
+    :rtype: list
+    :return: The scripts that match.
+    """
+    active = server_scripts[0]
+    server_scripts = server_scripts[1]
+    if active:
+        server_scripts = [active] + server_scripts
+    matched_scripts = glob_match(server_scripts, globs)
+    if sort:
+        return sorted(matched_scripts)
+    return matched_scripts
+
+
+class ArgumentParser(argparse.ArgumentParser):
+    """Subclass of ArgumentParser that raises ValueError instead of exiting."""
+    def exit(self, status=0, message=None):
+        """Raise an assertion instead of exiting when ArgumentParser exits.
+
+        If message is not None, it will be printed to stderr.  ValueError
+        will then be raised with message as its parameter.
+
+        Args:
+            status: The status that is normally passed to exit().  Ignored.
+            message: String to be printed and used to initialize ValueError.
+
+        Raises:
+            ValueError: The argument parser is exiting.
+        """
+
+        del status  # unused
+        if message:
+            self._print_message(message, sys.stderr)
+        raise ValueError(message)
+
+class SieveCmd(cmd.Cmd):
+    """Subclass of Cmd to implement the shell."""
+    def __init__(self, sieve_client):
+        readline.set_completer_delims(' \t\n')
+        super(SieveCmd, self).__init__()
+        self.sieve_client = sieve_client
+        self.doc_header = 'Commands (type help <topic>):'
+        self.misc_header = 'Other help topics:'
+        self.ruler = ''
+        self.prompt = '> '
+
+    def cmdloop_catches_keyboard_interrupt(self):
+        """Wrapper around cmdloop() that politely handles keyboard interrupts"""
+        running = True
+        while running:
+            try:
+                self.cmdloop()
+                running = False  # cmdloop returned; we should exit
+            except KeyboardInterrupt:
+                print()
+
+    def emptyline(self):
+        return False
+
+    # shell '!' command
+    @staticmethod
+    def do_shell(line):
+        """Implements the '!' (shell) command
+
+        This command passes the remainder of the command line to os.system().
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        os.system(line)
+        return False
+    @staticmethod
+    def help_shell():
+        """Implements help for the '!' (shell) command"""
+        print('usage: shell|! command')
+        print()
+        print('Execute shell command')
+
+    # comment '_' command
+    @staticmethod
+    def do__(line):
+        """Implements the '_' (comment) command
+
+        This command ignores all parameters.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        # Ignore anything on this 'comment' line
+        del line  # unused
+        return False
+    @staticmethod
+    def help__():
+        """Implements help for the '_' (comment) command"""
+        print('usage: _ comments')
+        print()
+        print('Enter comments')
+
+    # ci commands
+    parse_ci = ArgumentParser(
+        prog='ci',
+        description='Print user@host:port of current connection.')
+    help_ci = parse_ci.print_help
+    def do_ci(self, line):
+        """Implements the ci commands
+
+        The ci command prints the host, port and user of the connection to
+        the Sieve server,
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: True if no error indicating the command processor should exit.
+        """
+        try:
+            _args = self.parse_ci.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        conn_info = self.sieve_client.conn_info
+        print(f'{conn_info.user}@{conn_info.host}:{conn_info.port}')
+        return False
+
+    # logout, quit, exit and EOF commands
+    parse_logout = ArgumentParser(
+        prog='logout|exit|quit|EOF',
+        description='Logout from Sieve server and exit.')
+    help_logout = parse_logout.print_help
+    def do_logout(self, line):
+        """Implements the logout, exit, quit and EOF commands
+
+        The logout, exit and quit commands all do the same thing as
+        pressing ^D to indicate an EOF: they logout from the Sieve server,
+        disconnect the socket and exit the program.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: True if no error indicating the command processor should exit.
+        """
+        try:
+            _args = self.parse_logout.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        self.sieve_client.logout()
+        del self.sieve_client
+        if not self.lastcmd:
+            print()
+        return True
+    help_exit = parse_logout.print_help
+    do_exit = do_logout
+    help_quit = parse_logout.print_help
+    do_quit = do_logout
+    help_EOF = parse_logout.print_help
+    do_EOF = do_logout
+
+    # caps command
+    parse_caps = ArgumentParser(
+        prog='caps',
+        description='List Sieve server capabilites.',
+        epilog='The CAPABILITY arguments are glob expanded.')
+    parse_caps.add_argument('--command-only', dest='only',
+                            action='store_const', const='command',
+                            help='Show only capabilites returned by command')
+    parse_caps.add_argument('--connect-only', dest='only',
+                            action='store_const', const='connect',
+                            help='Show only capabilites returned by connect')
+    parse_caps.add_argument('-1', dest='fmt', action='store_const', const='1',
+                            help='(The digit "one".) Single column output')
+    parse_caps.add_argument('-C', dest='fmt', action='store_const', const='C',
+                            help='Multiple column output (the default)')
+    parse_caps.add_argument('globs', metavar='CAPABILITY', nargs='*',
+                            help='Only display given CAPABILITY(s)')
+    help_caps = parse_caps.print_help
+    def do_caps(self, line):
+        """Implements the caps command
+
+        The caps command lists the Sieve capabilities that the server has.
+        If CAPABILITYs are specified, only capabilities that match those
+        glob patterns will be listed.  Note that some servers do not
+        provide the same list of capabilites in response to the connection
+        being made and to the CAPABILITY command.  By default, caps will
+        show all the capabilities that either mechanism provide.  The
+        --command-only and --connect-only options can be used to list
+        capabilities that were provide by just one or the other.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_caps.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        caps_from_connect = set(self.sieve_client.get_sieve_capabilities())
+
+        caps_from_command = set()
+        for cape in self.sieve_client.capability().splitlines():
+            key, val = cape.split(maxsplit=1)
+            if key == b'"SIEVE"':
+                val = [c.decode('utf-8').strip('"') for c in val.split()]
+                caps_from_command = set(val)
+                break
+
+        if args.only == 'command':
+            caps = caps_from_command - caps_from_connect
+        elif args.only == 'connect':
+            caps = caps_from_connect - caps_from_command
+        else:
+            caps = caps_from_command.intersection(caps_from_connect)
+
+        caps = sorted(glob_match(caps, args.globs, source_type='capability'))
+
+        if args.fmt == '1':
+            for cap in caps:
+                print(cap)
+        else:
+            multicolumn_print(caps)
+
+        return False
+
+    # ls command
+    parse_ls = ArgumentParser(
+        prog='ls',
+        description='List scripts present on Sieve server.',
+        epilog='The SCRIPT arguments are glob expanded.')
+    parse_ls.add_argument('-1', dest='fmt', action='store_const', const='1',
+                          help='(The digit "one".) Single column output')
+    parse_ls.add_argument('-C', dest='fmt', action='store_const', const='C',
+                          help='Multiple column output (the default)')
+    parse_ls.add_argument('-F', '--classify', action='store_true',
+                          help="Append an asterisk to active script's name")
+    parse_ls.add_argument('-f', dest='sort', action='store_false',
+                          help='Do not sort the output')
+    parse_ls.add_argument('-l', dest='fmt', action='store_const', const='l',
+                          help='Output one line per script with size and name')
+    parse_ls.add_argument('globs', metavar='SCRIPT', nargs='*',
+                          help='Only display the given SCRIPTs')
+    help_ls = parse_ls.print_help
+    def do_ls(self, line):
+        """Implements the ls command
+
+        The ls command lists the scripts that are on the Sieve server.  If
+        SCRIPTs are specified, only scripts that match those glob patterns
+        will be listed.  Note that if the '-l' option is used, do_ls will
+        temporarily download each matched script into memory in order to
+        determine the size.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_ls.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        server_scripts = self.sieve_client.listscripts()
+        active = server_scripts[0]
+        scripts = process_script_globs(server_scripts, args.globs,
+                                       sort=args.sort)
+
+        if args.fmt == '1':
+            for script in scripts:
+                if args.classify and script == active:
+                    script += '*'
+                print(script)
+        elif args.fmt == 'l':
+            for script in scripts:
+                size = len(self.sieve_client.getscript(script))
+                if args.classify and script == active:
+                    script += '*'
+                print(f'{size:8} {script}')
+        else:
+            if args.classify:
+                scripts = [s + '*' if s == active else s for s in scripts]
+            multicolumn_print(scripts)
+
+        return False
+
+    # hashsum command
+    parse_hashsum = ArgumentParser(
+        prog='hashsum',
+        description='Calculate hashes of Sieve server scripts.',
+        epilog='The SCRIPT arguments are glob expanded.')
+    parse_hashsum.add_argument('-a', '--algorithm', default='md5',
+                               choices=sorted(hashlib.algorithms_available),
+                               help='The hash algorithm to use (default=md5)')
+    parse_hashsum.add_argument('globs', metavar='SCRIPT', nargs='*',
+                               help='Only display the given SCRIPTs')
+    help_hashsum = parse_hashsum.print_help
+    def do_hashsum(self, line):
+        """Implements the hashsum command
+
+        The hashsum command lists hashes of scripts on the Sieve server.
+        Note each script will be downloaded into memory to determine the
+        hash.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_hashsum.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        scripts = process_script_globs(self.sieve_client.listscripts(),
+                                       args.globs)
+
+        for script in scripts:
+            content = self.sieve_client.getscript(script)
+            hsh = hashlib.new(args.algorithm)
+            hsh.update(bytes(content, 'utf-8'))
+            hexdigest = hsh.hexdigest()
+            print(f'{hexdigest}  {script}')
+
+        return False
+
+    # rm command
+    parse_rm = ArgumentParser(
+        prog='rm',
+        description="Remove one or more scripts.",
+        epilog='The SCRIPT arguments are glob expanded.')
+    parse_rm.add_argument('-v', '--verbose', action='store_true',
+                          help='Print names of scripts as they are deleted')
+    parse_rm.add_argument('globs', metavar='SCRIPT', nargs='*',
+                          help='Script(s) to remove.')
+    help_rm = parse_rm.print_help
+    def do_rm(self, line):
+        """Implements the rm command
+
+        The rm command allows the user to remove scripts from the server.
+        For convenience, globbing is done on the user input.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_rm.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        scripts = process_script_globs(self.sieve_client.listscripts(),
+                                       args.globs)
+
+        for script in scripts:
+            if not self.sieve_client.deletescript(script):
+                errmsg = self.sieve_client.error[1].decode()
+                print(f'{script}: {errmsg}', file=sys.stderr)
+            elif args.verbose:
+                print(script)
+
+        return False
+
+    # mv command
+    parse_mv = ArgumentParser(
+        prog='mv',
+        description="Move a script to a new name.",
+        epilog='The SOURCE argument is glob expanded.')
+    parse_mv.add_argument('-A', '--activate', action='store_true',
+                          help='Make destination the active script')
+    parse_mv.add_argument('-v', '--verbose', action='store_true',
+                          help='Print action taken')
+    parse_mv.add_argument('SOURCE', help='Source script name')
+    parse_mv.add_argument('DESTINATION', help='Destination script name')
+    help_mv = parse_mv.print_help
+    def do_mv(self, line):
+        """Implements the mv command
+
+        The mv command allows the user to move a script on the server to a
+        new name.  For convenience, globbing is done on the SOURCE, however
+        after globbing there may be only one source.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_mv.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        src = process_script_globs(self.sieve_client.listscripts(),
+                                   [args.SOURCE])
+        if len(src) != 1:
+            SieveCmd.parse_mv.print_usage(file=sys.stderr)
+            return False
+        src = src[0]
+        dst = args.DESTINATION
+
+        if not self.sieve_client.renamescript(src, dst):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Could not move {src!r} to {dst!r}: {errmsg}',
+                  file=sys.stderr)
+        elif args.verbose:
+            print(f'{src} -> {dst}')
+
+        if args.activate:
+            if not self.sieve_client.setactive(dst):
+                errmsg = self.sieve_client.error[1].decode()
+                print(f'{dst}: Could not be made active: {errmsg}',
+                      file=sys.stderr)
+            elif args.verbose:
+                print(f'{dst} now active.')
+
+        return False
+
+    # cp command
+    parse_cp = ArgumentParser(
+        prog='cp',
+        description="Copy a script to a new script.",
+        epilog='The SOURCE argument is glob expanded.')
+    parse_cp.add_argument('-A', '--activate', action='store_true',
+                          help='Make destination the active script')
+    parse_cp.add_argument('-v', '--verbose', action='store_true',
+                          help='Print action taken')
+    parse_cp.add_argument('SOURCE', help='Source script name')
+    parse_cp.add_argument('DESTINATION', help='Destination script name')
+    help_cp = parse_cp.print_help
+    def do_cp(self, line):
+        """Implements the cp command
+
+        The cp command allows the user to copy a script on the server to a
+        new script.  For convenience, globbing is done on the SOURCE,
+        however after globbing there may be only one source.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_cp.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        src = process_script_globs(self.sieve_client.listscripts(),
+                                   [args.SOURCE])
+        if len(src) != 1:
+            SieveCmd.parse_cp.print_usage(file=sys.stderr)
+            return False
+        src = src[0]
+        dst = args.DESTINATION
+
+        content = self.sieve_client.getscript(src)
+        if not content:
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Could not get {src!r} script: {errmsg}', file=sys.stderr)
+            return False
+
+        if not self.sieve_client.havespace(dst, len(content)):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Not enough space for {dst!r}: {errmsg}', file=sys.stderr)
+            return False
+
+        if not self.sieve_client.putscript(dst, content):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Could not put {dst!r} script:\n{errmsg}', file=sys.stderr)
+        elif args.verbose:
+            print(f'{src} -> {dst}')
+
+        if args.activate:
+            if not self.sieve_client.setactive(dst):
+                errmsg = self.sieve_client.error[1].decode()
+                print(f'{dst}: Could not be made active: {errmsg}',
+                      file=sys.stderr)
+            elif args.verbose:
+                print(f'{dst} now active.')
+
+        return False
+
+    # get command
+    parse_get = ArgumentParser(
+        prog='get',
+        description="Make a local copy of a Sieve server script.",
+        epilog='The SCRIPT argument is glob expanded.  If FILE is not '
+               'given, it defaults to appending ".siv" to the SCRIPT name.')
+    parse_get.add_argument('-v', '--verbose', action='store_true',
+                           help='Print action taken')
+    parse_get.add_argument('SCRIPT', help='Source script name')
+    parse_get.add_argument('FILE', help='Destination file name', nargs='?')
+    help_get = parse_get.print_help
+    def do_get(self, line):
+        """Implements the get command
+
+        The get command allows the user to copy a script on the server to a
+        local file.  For convenience, globbing is done on the SCRIPT,
+        however after globbing there may be only one script.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_get.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        src = process_script_globs(self.sieve_client.listscripts(),
+                                   [args.SCRIPT])
+        if len(src) != 1:
+            SieveCmd.parse_get.print_usage(file=sys.stderr)
+            return False
+        src = src[0]
+        dst = args.FILE
+        if not dst:
+            dst = src + '.siv'
+
+        content = self.sieve_client.getscript(src)
+        if not content:
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Could not get {src!r} script: {errmsg}', file=sys.stderr)
+            return False
+
+        try:
+            with open(dst, 'w') as file:
+                file.write(content)
+        except OSError as err:
+            print(f'{dst}: {err}', file=sys.stderr)
+            return False
+
+        print(f'Sieve server script {src!r} copied to file {dst!r}.')
+
+        return False
+
+    # put command
+    parse_put = ArgumentParser(
+        prog='put',
+        description="Copy a local file to a Sieve server script.",
+        epilog='If the SCRIPT argument is not given, it defaults to '
+               'the FILE name after removing a ".siv" suffix if present.')
+    parse_put.add_argument('-A', '--activate', action='store_true',
+                           help='Make destination the active script')
+    parse_put.add_argument('-v', '--verbose', action='store_true',
+                           help='Print action taken')
+    parse_put.add_argument('FILE', help='Source file name')
+    parse_put.add_argument('SCRIPT', help='Destination script name', nargs='?')
+    help_put = parse_put.print_help
+    def do_put(self, line):
+        """Implements the put command
+
+        The put command allows the user to copy a local file to a script on
+        the server.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_put.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        src = args.FILE
+        dst = args.SCRIPT
+        if not dst:
+            dst = os.path.basename(src)
+            dst_name, dst_ext = os.path.splitext(dst)
+            if dst_ext == '.siv':
+                dst = dst_name
+
+        content = ''
+        try:
+            with open(src, 'r') as file:
+                content += file.read()
+        except OSError as err:
+            print(f'{dst}: {err}', file=sys.stderr)
+            return False
+
+        if not self.sieve_client.havespace(dst, len(content)):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'There is not space for {dst!r}: {errmsg}', file=sys.stderr)
+            return False
+
+        if not self.sieve_client.checkscript(content):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Error in {src!r} script: {errmsg}', file=sys.stderr)
+            return False
+
+        if not self.sieve_client.putscript(dst, content):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'Could not put {dst!r} script:\n{errmsg}', file=sys.stderr)
+        elif args.verbose:
+            print(f'File {src!r} copied to Sieve server script {dst!r}.')
+
+        if args.activate:
+            if not self.sieve_client.setactive(dst):
+                errmsg = self.sieve_client.error[1].decode()
+                print(f'{dst}: Could not be made active: {errmsg}',
+                      file=sys.stderr)
+            elif args.verbose:
+                print(f'{dst} now active.')
+
+        return False
+
+    # pact command
+    parse_pact = ArgumentParser(
+        prog='pact',
+        description='Print name of active script.')
+    help_pact = parse_pact.print_help
+    def do_pact(self, line):
+        """Implements the pact command
+
+        The pact command prints the name of the active script.  If no
+        script is active, nothing will be printed.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            _args = self.parse_pact.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        scripts = self.sieve_client.listscripts()
+        active = scripts[0]
+        if active:
+            print(active)
+
+        return False
+
+    # cact command
+    parse_cact = ArgumentParser(
+        prog='cact',
+        description="Change active script.  Pass '' to inactivate all scripts.",
+        epilog='The SCRIPT argument is glob expanded.')
+    parse_cact.add_argument('-v', '--verbose', action='store_true',
+                            help='Print name of script made active.')
+    parse_cact.add_argument('globs', metavar='SCRIPT', nargs=1,
+                            help='Script to make active.')
+    help_cact = parse_cact.print_help
+    def do_cact(self, line):
+        """Implements the cact command
+
+        The cact command allows the user to change the active script to the
+        one specified or to inactivate all scripts by passing ''.  For
+        convenience, globbing is done on the user input.
+
+        :param line: The user's command with the command name removed.
+        :rtype: boolean
+        :return: Always False indicating the command processor should not exit.
+        """
+        try:
+            args = self.parse_cact.parse_args(shlex.split(line))
+        except ValueError:
+            return False
+
+        script = args.globs[0]
+        if script != '':
+            scripts = process_script_globs(self.sieve_client.listscripts(),
+                                           args.globs)
+            if len(scripts) != 1:
+                print(f'cact: {scripts}: Only one script may be made active.')
+                SieveCmd.parse_cact.print_usage(file=sys.stderr)
+                return False
+            script = scripts[0]
+
+        if not self.sieve_client.setactive(script):
+            errmsg = self.sieve_client.error[1].decode()
+            print(f'{script}: Could not be made active: {errmsg}',
+                  file=sys.stderr)
+        elif args.verbose:
+            print(f'{script}')
+
+        return False
+
+
+def main():
+    """main() for sievesh.py
+
+    Parse the command line arguments, connect to the Sieve server and then
+    start processing commands from the user.
+
+    :rtype: int
+    :returns: exit status (currently always zero)
+    """
+    argp = argparse.ArgumentParser(description=__doc__)
+    argp.add_argument('-F', '--config-file',
+                      default=os.path.expanduser('~/.sieveshrc'),
+                      help="The configuration file to use.")
+    argp.add_argument('-c', '--config-section', default='DEFAULT',
+                      help="The section of the configuration file to use.")
+    argp.add_argument('--host',
+                      help="The Sieve server host to connect to.")
+    argp.add_argument('--port',
+                      help="The port to connect to on the server.")
+    argp.add_argument('--user',
+                      help='The user to connect as.')
+    argp.add_argument('--password',
+                      help='The password will be prompted for if not given.')
+    argp.add_argument('-d', '--debug', action='store_true',
+                      help='Show interactions with the Sieve server.')
+    argp.add_argument('-v', '--verbose', action='store_true',
+                      help='Show connection information.')
+    args = argp.parse_args()
+
+    conn_info = ConnectInfo(port=4190)
+
+    cfgp = configparser.ConfigParser()
+    cfgp.read(args.config_file)
+    cfg = cfgp[args.config_section]
+    conn_info.host = cfg.get('host', conn_info.host)
+    conn_info.port = cfg.getint('port', conn_info.port)
+    conn_info.user = cfg.get('user', conn_info.user)
+    conn_info.password = cfg.get('password', conn_info.password)
+
+    if args.host:
+        conn_info.host = args.host
+    if args.port:
+        conn_info.port = args.port
+    if args.user:
+        conn_info.user = args.user
+    if args.password:
+        conn_info.password = args.password
+
+    missing_ci = False
+    if not conn_info.host:
+        print(f'The host to connect to was not provided.', file=sys.stderr)
+        missing_ci = True
+    if not conn_info.port:
+        print(f'The port to connect to was not provided.', file=sys.stderr)
+        missing_ci = True
+    if not conn_info.user:
+        print(f'The user to connect as was not provided.', file=sys.stderr)
+        missing_ci = True
+    if missing_ci:
+        argp.print_usage(file=sys.stderr)
+        return 2
+
+    if args.verbose:
+        print(f'Connecting to port {conn_info.port!r} '
+              f'on {conn_info.host!r} as user {conn_info.user!r}')
+
+    if not conn_info.password:
+        conn_info.password = getpass.getpass()
+
+    try:
+        sieve_client = Client(conn_info, debug=args.debug)
+    except Error as err:
+        print(f'Could not connect: {err}', file=sys.stderr)
+        return 1
+
+    sievecmd = SieveCmd(sieve_client)
+    sievecmd.cmdloop_catches_keyboard_interrupt()
+    return 0
+
+if __name__ == "__main__":
+    sys.exit(main())
