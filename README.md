@@ -1,5 +1,6 @@
 # sievesh
-A self contained Python 3 script implementing a managesieve client to administer Sieve scripts à la ftp clients.
+A Python 3 script that uses the sievelib module to administer Sieve scripts
+à la ftp clients.
 
 ## Usage
 sievesh is a Python 3 script that implements an interactive
@@ -44,7 +45,6 @@ cp | Copy a script to a new script.
 mv | Move a script to a new name.
 rm | Remove one or more scripts.
 hashsum | Calculate hashes of Sieve server scripts.
-ci | Print user@host:port of current connection.
 caps | List Sieve server capabilites.
 shell or ! | Execute a shell command on the local system
 _ | comments; all arguments are ignored
